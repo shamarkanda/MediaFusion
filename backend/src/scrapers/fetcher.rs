@@ -148,6 +148,26 @@ pub async fn fetch_plain(client: &Client, url: &str) -> Option<FetchResult> {
     })
 }
 
+/// Plain HTTP GET returning raw bytes, for binary downloads (e.g. `.torrent` files).
+/// TRAWL's `request.get` only ever returns a JSON string body, which silently
+/// mangles binary content — sites that serve `.torrent` files directly (no JS
+/// challenge on the download endpoint itself) must use this instead of
+/// `fetch_trawl_bytes`.
+pub async fn fetch_plain_bytes(client: &Client, url: &str) -> Option<Vec<u8>> {
+    let resp = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        tracing::debug!("fetch_plain_bytes HTTP {} for {url}", resp.status());
+        return None;
+    }
+    resp.bytes().await.ok().map(|b| b.to_vec())
+}
+
 pub async fn fetch_trawl(client: &Client, trawl_url: &str, url: &str) -> Option<FetchResult> {
     let solution = trawl_v1_request(
         client,

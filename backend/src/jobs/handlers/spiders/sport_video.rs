@@ -1,7 +1,10 @@
 /// Scraper for sport-video.org.ua — sports torrent listings.
 ///
-/// The site's torrent download endpoints are protected by the adm.tools JavaScript
-/// bot challenge. TRAWL (`TRAWL_URL`) solves these via its browser pool.
+/// The category/detail HTML pages are behind the adm.tools JavaScript bot
+/// challenge; TRAWL (`TRAWL_URL`) solves those via its browser pool. The
+/// `.torrent` download links themselves are not gated, and must be fetched
+/// with plain HTTP: TRAWL's `request.get` only returns a JSON string body,
+/// which mangles binary content.
 ///
 /// Site structure:
 ///   - Category page URL: configured in `scraper_config.yaml` under
@@ -23,7 +26,7 @@ use crate::{
     parser,
     scrapers::{
         ScrapedStream, SearchMeta,
-        fetcher::{fetch_plain, fetch_trawl, fetch_trawl_bytes},
+        fetcher::{fetch_plain, fetch_plain_bytes, fetch_trawl, fetch_trawl_bytes},
         media_resolve, stream_convert,
     },
     util::rate_limit,
@@ -351,9 +354,12 @@ impl JobHandler for SportVideoCrawl {
                     // the browser pool and the target site.
                     rate_limit::wait_rpm(rate_key, 15).await;
 
-                    let torrent_bytes = fetch_trawl_bytes(client, trawl, torrent_url)
-                        .await
-                        .unwrap_or_default();
+                    let torrent_bytes = match fetch_plain_bytes(client, torrent_url).await {
+                        Some(b) if !b.is_empty() => b,
+                        _ => fetch_trawl_bytes(client, trawl, torrent_url)
+                            .await
+                            .unwrap_or_default(),
+                    };
 
                     let Some(info_hash) = extract_info_hash_from_torrent(&torrent_bytes) else {
                         debug!(

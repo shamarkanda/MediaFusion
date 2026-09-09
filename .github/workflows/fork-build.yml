@@ -1,0 +1,150 @@
+name: Fork build (GHCR)
+# Manual build+push for this fork, decoupled from upstream's release-triggered
+# main.yml (which needs DOCKERHUB_* secrets we don't have and pushes to
+# mhdzumair/mediafusion, not ours). Builds only linux/amd64+arm64 — the two
+# platforms this fork actually runs on.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push (in addition to :latest)"
+        required: false
+        default: "fork"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  rust-build:
+    name: Build Rust Binaries (${{ matrix.label }})
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: linux-amd64
+            arch: amd64
+            rust_target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            label: linux-arm64
+            arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: backend
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+
+      - name: Build frontend
+        run: |
+          cd clients/frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Build API server (embed-frontend)
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          cd backend
+          cargo build --release --features tls-native,embed-frontend \
+            --target ${{ matrix.rust_target }} \
+            --bin mediafusion-api
+
+      - name: Build worker (nsfw-classifier)
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          cd backend
+          cargo build --release --features tls-native,nsfw-classifier \
+            --target ${{ matrix.rust_target }} \
+            --bin mediafusion-worker
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp "backend/target/${{ matrix.rust_target }}/release/mediafusion-api" \
+            "dist/mediafusion-api-${{ matrix.arch }}"
+          cp "backend/target/${{ matrix.rust_target }}/release/mediafusion-worker" \
+            "dist/mediafusion-worker-${{ matrix.arch }}"
+          chmod +x dist/*
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-dist-${{ matrix.label }}
+          path: dist/
+          retention-days: 1
+
+  docker-build:
+    needs: rust-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download linux amd64 binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rust-dist-linux-amd64
+          path: rust-dist/amd64/
+
+      - name: Download linux arm64 binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rust-dist-linux-arm64
+          path: rust-dist/arm64/
+
+      - name: Rename artifacts to match Dockerfile expectations
+        run: |
+          mv rust-dist/amd64/mediafusion-api-amd64    rust-dist/amd64/mediafusion-api
+          mv rust-dist/amd64/mediafusion-worker-amd64 rust-dist/amd64/mediafusion-worker
+          mv rust-dist/arm64/mediafusion-api-arm64    rust-dist/arm64/mediafusion-api
+          mv rust-dist/arm64/mediafusion-worker-arm64 rust-dist/arm64/mediafusion-worker
+          chmod +x rust-dist/amd64/* rust-dist/arm64/*
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          file: ./deployment/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha,scope=mediafusion-fork
+          cache-to: type=gha,mode=max,scope=mediafusion-fork
+          build-args: VERSION=${{ inputs.tag }}-${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/mediafusion:latest
+            ghcr.io/${{ github.repository_owner }}/mediafusion:${{ inputs.tag }}
