@@ -2658,17 +2658,26 @@ pub async fn list_schedulers(
     // configured), starving everything else on the shared Postgres instance.
     use futures::stream::StreamExt as _;
     const LIST_SCHEDULERS_CONCURRENCY: usize = 8;
-    let mut jobs: Vec<Value> = futures::stream::iter(
-        SCHEDULER_JOBS
-            .iter()
-            .filter(|(_id, _, cat, _, _)| params.category.as_deref().is_none_or(|c| c == *cat))
-            .map(|(id, name, cat, desc, cron)| {
-                fetch_job_info(&state.pool_ro, id, name, cat, desc, cron, global_disabled)
-            }),
-    )
-    .buffer_unordered(LIST_SCHEDULERS_CONCURRENCY)
-    .collect()
-    .await;
+    let mut futs = Vec::with_capacity(SCHEDULER_JOBS.len());
+    for entry in SCHEDULER_JOBS.iter() {
+        if params.category.as_deref().is_some_and(|c| c != entry.2) {
+            continue;
+        }
+        let (id, name, cat, desc, cron) = *entry;
+        futs.push(fetch_job_info(
+            &state.pool_ro,
+            id,
+            name,
+            cat,
+            desc,
+            cron,
+            global_disabled,
+        ));
+    }
+    let mut jobs: Vec<Value> = futures::stream::iter(futs)
+        .buffer_unordered(LIST_SCHEDULERS_CONCURRENCY)
+        .collect()
+        .await;
 
     if params.enabled_only.unwrap_or(false) {
         jobs.retain(|j| j["is_enabled"].as_bool() == Some(true));
