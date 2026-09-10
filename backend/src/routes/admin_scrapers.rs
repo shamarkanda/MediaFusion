@@ -2651,15 +2651,24 @@ pub async fn list_schedulers(
 
     let global_disabled = state.config.disable_all_scheduler;
 
-    let futures: Vec<_> = SCHEDULER_JOBS
-        .iter()
-        .filter(|(_id, _, cat, _, _)| params.category.as_deref().is_none_or(|c| c == *cat))
-        .map(|(id, name, cat, desc, cron)| {
-            fetch_job_info(&state.pool_ro, id, name, cat, desc, cron, global_disabled)
-        })
-        .collect();
-
-    let mut jobs: Vec<Value> = futures::future::join_all(futures).await;
+    // Bounded concurrency: SCHEDULER_JOBS has grown past 45 entries and each
+    // fetch_job_info() call holds a pool connection for 2 sequential queries.
+    // An unbounded join_all() here let a single dashboard load/refresh claim
+    // most of the pool (state.pool_ro == state.pool when no read replica is
+    // configured), starving everything else on the shared Postgres instance.
+    use futures::stream::StreamExt as _;
+    const LIST_SCHEDULERS_CONCURRENCY: usize = 8;
+    let mut jobs: Vec<Value> = futures::stream::iter(
+        SCHEDULER_JOBS
+            .iter()
+            .filter(|(_id, _, cat, _, _)| params.category.as_deref().is_none_or(|c| c == *cat))
+            .map(|(id, name, cat, desc, cron)| {
+                fetch_job_info(&state.pool_ro, id, name, cat, desc, cron, global_disabled)
+            }),
+    )
+    .buffer_unordered(LIST_SCHEDULERS_CONCURRENCY)
+    .collect()
+    .await;
 
     if params.enabled_only.unwrap_or(false) {
         jobs.retain(|j| j["is_enabled"].as_bool() == Some(true));
