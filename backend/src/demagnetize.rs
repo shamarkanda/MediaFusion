@@ -681,7 +681,7 @@ fn parse_ut_metadata_response(data: &[u8]) -> Option<UtResponse> {
 // ─── Minimal bencode parser ───────────────────────────────────────────────────
 
 /// Internal bencode value type — only what BEP-9/10 messages require.
-enum BVal {
+pub(crate) enum BVal {
     Int(i64),
     Bytes(Vec<u8>),
     Dict(HashMap<String, BVal>),
@@ -689,7 +689,7 @@ enum BVal {
 }
 
 /// Parse a bencode dict starting at `data[0]` and return `(dict, bytes_consumed)`.
-fn decode_bencode_dict(data: &[u8]) -> Option<(HashMap<String, BVal>, usize)> {
+pub(crate) fn decode_bencode_dict(data: &[u8]) -> Option<(HashMap<String, BVal>, usize)> {
     match decode_bval(data, 0)? {
         (BVal::Dict(d), end) => Some((d, end)),
         _ => None,
@@ -750,7 +750,7 @@ fn decode_bval(data: &[u8], pos: usize) -> Option<(BVal, usize)> {
 // ─── Info-dict → TorrentMeta ──────────────────────────────────────────────────
 
 /// Parse a raw bencoded info dictionary into a `TorrentMeta`.
-fn parse_info_dict(raw: &[u8]) -> Result<TorrentMeta, String> {
+pub(crate) fn parse_info_dict(raw: &[u8]) -> Result<TorrentMeta, String> {
     let (dict, _) =
         decode_bencode_dict(raw).ok_or_else(|| "could not parse bencode info dict".to_string())?;
 

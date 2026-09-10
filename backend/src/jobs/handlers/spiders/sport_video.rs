@@ -19,6 +19,7 @@ use scraper::{Html, Selector};
 use tracing::{debug, info, warn};
 
 use crate::{
+    demagnetize::{BVal, decode_bencode_dict, parse_info_dict},
     jobs::{
         error::JobError,
         handler::{JobCtx, JobHandler},
@@ -174,15 +175,19 @@ fn parse_torrent_detail_page(html: &str, base_url: &str) -> Vec<String> {
 
 // ─── Torrent info_hash from .torrent file ─────────────────────────────────────
 
-fn extract_info_hash_from_torrent(data: &[u8]) -> Option<String> {
-    use sha1::{Digest, Sha1};
+fn locate_info_dict(data: &[u8]) -> Option<(usize, usize)> {
     let needle = b"4:info";
     let pos = data.windows(needle.len()).position(|w| w == needle)?;
     let info_start = pos + needle.len();
     let info_end = bencode_end(data, info_start)?;
-    let info_slice = &data[info_start..info_end];
+    Some((info_start, info_end))
+}
+
+fn extract_info_hash_from_torrent(data: &[u8]) -> Option<String> {
+    use sha1::{Digest, Sha1};
+    let (info_start, info_end) = locate_info_dict(data)?;
     let mut hasher = Sha1::new();
-    hasher.update(info_slice);
+    hasher.update(&data[info_start..info_end]);
     Some(
         hasher
             .finalize()
@@ -190,6 +195,42 @@ fn extract_info_hash_from_torrent(data: &[u8]) -> Option<String> {
             .map(|b| format!("{b:02x}"))
             .collect(),
     )
+}
+
+/// Pull trackers (`announce` + `announce-list`) and total size out of a raw
+/// `.torrent` file. sport-video.org.ua torrents ship real UDP trackers that
+/// were previously discarded entirely, leaving debrid providers to rely on
+/// slow DHT-only peer discovery for every single scraped item.
+fn extract_trackers_and_size(data: &[u8]) -> (Vec<String>, Option<i64>) {
+    let mut trackers = Vec::new();
+    if let Some((dict, _)) = decode_bencode_dict(data) {
+        if let Some(BVal::Bytes(b)) = dict.get("announce")
+            && let Ok(s) = String::from_utf8(b.clone())
+        {
+            trackers.push(s);
+        }
+        if let Some(BVal::List(tiers)) = dict.get("announce-list") {
+            for tier in tiers {
+                let BVal::List(urls) = tier else { continue };
+                for url in urls {
+                    if let BVal::Bytes(b) = url
+                        && let Ok(s) = String::from_utf8(b.clone())
+                    {
+                        trackers.push(s);
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    trackers.retain(|t| seen.insert(t.clone()));
+
+    let size = locate_info_dict(data)
+        .and_then(|(start, end)| parse_info_dict(&data[start..end]).ok())
+        .map(|meta| meta.total_size)
+        .filter(|&sz| sz > 0);
+
+    (trackers, size)
 }
 
 fn bencode_end(data: &[u8], pos: usize) -> Option<usize> {
@@ -369,19 +410,21 @@ impl JobHandler for SportVideoCrawl {
                         continue;
                     };
 
+                    let (announce_list, size) = extract_trackers_and_size(&torrent_bytes);
+
                     let parsed = parser::parse_sports_title(&block.title);
                     block_streams.push(ScrapedStream {
                         info_hash,
                         name: block.title.clone(),
                         source: "sport-video.org.ua".to_string(),
                         seeders: None,
-                        size: None,
+                        size,
                         parsed,
                         files: vec![],
                         is_cached: false,
                         torrent_type: crate::db::TorrentType::Public,
-                        torrent_file: None,
-                        announce_list: vec![],
+                        torrent_file: Some(torrent_bytes),
+                        announce_list,
                         uploader: None,
                     });
                 }
