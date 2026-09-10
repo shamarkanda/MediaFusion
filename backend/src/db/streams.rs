@@ -917,8 +917,8 @@ pub async fn link_torrent_trackers(
     sqlx::query(
         r#"
         WITH input AS (SELECT unnest($1::text[]) AS url)
-        INSERT INTO tracker(url)
-        SELECT url FROM input
+        INSERT INTO tracker(url, status, success_count, failure_count, success_rate, created_at)
+        SELECT url, 'UNKNOWN', 0, 0, 0, now() FROM input
         ON CONFLICT(url) DO NOTHING
         "#,
     )

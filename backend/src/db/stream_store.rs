@@ -1,5 +1,5 @@
 use sqlx::PgPool;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::providers::usenet::nzb_url::sanitize_nzb_url;
 
@@ -170,8 +170,11 @@ pub async fn store_torrent_stream(
     }
     ts_result?;
 
-    if !stream.announce_list.is_empty() {
-        let _ = super::streams::link_torrent_trackers(pool, stream_id, &stream.announce_list).await;
+    if !stream.announce_list.is_empty()
+        && let Err(e) =
+            super::streams::link_torrent_trackers(pool, stream_id, &stream.announce_list).await
+    {
+        warn!(stream_id = stream_id.0, "link_torrent_trackers failed: {e}");
     }
 
     link_torrent_to_media(pool, stream_id, &stream.files, opts).await?;
