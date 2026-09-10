@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use fred::prelude::{HashesInterface, SetsInterface};
+use fred::prelude::{HashesInterface, SortedSetsInterface};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -21,6 +21,13 @@ use crate::{
 pub struct BackgroundSearch;
 
 const BATCH_SIZE: usize = 10;
+
+/// How long a "processing" claim on an item is honored before we treat it as
+/// abandoned and reclaim the item for re-scraping. Must sit above this handler's
+/// own MAX_DURATION_SECS: a genuinely live item is always still under that cap,
+/// so anything older than it belongs to a run that was killed (timeout, crash,
+/// redeploy) mid-item and never reached the cleanup below.
+const PROCESSING_STALE_SECS: f64 = <BackgroundSearch as JobHandler>::MAX_DURATION_SECS as f64;
 
 // ─── Queue item value shape ───────────────────────────────────────────────────
 
@@ -127,11 +134,11 @@ impl JobHandler for BackgroundSearch {
             if !is_due {
                 continue;
             }
-            let in_processing: bool = redis
-                .sismember::<bool, _, _>(background_queue::PROCESSING_KEY, item_key.as_str())
+            let claimed_at: Option<f64> = redis
+                .zscore::<Option<f64>, _, _>(background_queue::PROCESSING_KEY, item_key.as_str())
                 .await
-                .unwrap_or(false);
-            if in_processing {
+                .unwrap_or(None);
+            if claimed_at.is_some_and(|ts| now - ts < PROCESSING_STALE_SECS) {
                 continue;
             }
             due.push((item_key.clone(), background_queue::MOVIES_KEY));
@@ -147,11 +154,11 @@ impl JobHandler for BackgroundSearch {
             if !is_due {
                 continue;
             }
-            let in_processing: bool = redis
-                .sismember::<bool, _, _>(background_queue::PROCESSING_KEY, item_key.as_str())
+            let claimed_at: Option<f64> = redis
+                .zscore::<Option<f64>, _, _>(background_queue::PROCESSING_KEY, item_key.as_str())
                 .await
-                .unwrap_or(false);
-            if in_processing {
+                .unwrap_or(None);
+            if claimed_at.is_some_and(|ts| now - ts < PROCESSING_STALE_SECS) {
                 continue;
             }
             due.push((item_key.clone(), background_queue::SERIES_KEY));
@@ -166,7 +173,14 @@ impl JobHandler for BackgroundSearch {
             }
 
             let _ = redis
-                .sadd::<(), _, _>(background_queue::PROCESSING_KEY, item_key.as_str())
+                .zadd::<(), _, _>(
+                    background_queue::PROCESSING_KEY,
+                    None,
+                    None,
+                    false,
+                    false,
+                    (now, item_key.as_str()),
+                )
                 .await;
 
             let result = process_item(&item_key, queue_key, &ctx.state, now).await;
@@ -176,7 +190,7 @@ impl JobHandler for BackgroundSearch {
             }
 
             let _ = redis
-                .srem::<(), _, _>(background_queue::PROCESSING_KEY, item_key.as_str())
+                .zrem::<(), _, _>(background_queue::PROCESSING_KEY, item_key.as_str())
                 .await;
         }
 
