@@ -86,6 +86,10 @@ impl JobHandler for ImdbDatasetImport {
     const QUEUE: &'static str = "imdb_dataset_import";
     const CONCURRENCY: usize = 1;
     const MAX_ATTEMPTS: i32 = 1;
+    // Full dataset imports over millions of titles legitimately run long,
+    // and aren't retried (MAX_ATTEMPTS above) -- give it much more rope than
+    // the default hang timeout before the runner kills it.
+    const MAX_DURATION_SECS: u64 = 24 * 3600;
     type Args = ImdbImportArgs;
 
     async fn run(&self, args: ImdbImportArgs, ctx: JobCtx) -> Result<(), JobError> {

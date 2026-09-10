@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::Semaphore;
-use tokio::time::sleep;
+use tokio::time::{interval, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -17,6 +17,12 @@ use crate::state::AppState;
 
 const POLL_FALLBACK_SECS: u64 = 2;
 const IDLE_CLAIM_TIMEOUT_MINS: i64 = 30;
+// Reclaiming only once at startup leaves a queue stuck for the rest of the
+// process's life if a job hangs mid-run without hitting the per-job timeout
+// below (e.g. it was still under MAX_DURATION_SECS but the process was
+// restarted for other reasons while it was orphaned). Re-checking regularly
+// bounds that window instead of requiring a full worker restart.
+const RECLAIM_INTERVAL_SECS: u64 = 5 * 60;
 
 struct ClaimedJob {
     id: i64,
@@ -87,6 +93,9 @@ impl QueueRunner {
             warn!(queue = self.queue, "LISTEN job_cancel failed: {e}");
         }
 
+        let mut reclaim_tick = interval(Duration::from_secs(RECLAIM_INTERVAL_SECS));
+        reclaim_tick.tick().await; // first tick fires immediately; we already reclaimed above
+
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
@@ -107,6 +116,9 @@ impl QueueRunner {
                 }
                 _ = sleep(Duration::from_secs(POLL_FALLBACK_SECS)) => {
                     self.claim_and_dispatch(&pool).await;
+                }
+                _ = reclaim_tick.tick() => {
+                    self.reclaim_stale_jobs().await;
                 }
             }
         }
@@ -156,12 +168,31 @@ impl QueueRunner {
                 Self::write_event(&pool, job.id, "started", None).await;
 
                 let start = Instant::now();
+                let max_duration = Duration::from_secs(handler.max_duration_secs());
                 let handler = handler;
                 let payload = job.payload;
-                let result = super::log_capture::with_capture(&pool, job.id, async move {
-                    handler.run_erased(payload, ctx).await
-                })
-                .await;
+                let result = match timeout(
+                    max_duration,
+                    super::log_capture::with_capture(&pool, job.id, async move {
+                        handler.run_erased(payload, ctx).await
+                    }),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        // The timeout drops the inner future, which frees anything it
+                        // was holding (including, further up the call stack, this
+                        // task's semaphore permit once we return) -- this is what
+                        // actually stops a hung job from leaking its concurrency slot
+                        // forever, unlike reclaim_stale_jobs which only cleans up the
+                        // DB row after the fact.
+                        Err(JobError::other(format!(
+                            "exceeded max duration of {}s -- killed as a hang safeguard",
+                            max_duration.as_secs()
+                        )))
+                    }
+                };
                 let elapsed = start.elapsed();
 
                 super::cancel_tokens::deregister(job.id);
@@ -231,7 +262,14 @@ impl QueueRunner {
     }
 
     async fn reclaim_stale_jobs(&self) {
-        // Reset jobs that were running on this queue when the last worker crashed.
+        // Reset jobs that were running on this queue when their worker crashed.
+        // This now also runs periodically (not just at startup), so the threshold
+        // must sit above this handler's own MAX_DURATION_SECS + grace: the per-job
+        // timeout in claim_and_dispatch always frees a live task's row before then,
+        // so anything still 'running' past this point belongs to a process that's
+        // actually gone -- not a slow-but-live task we'd otherwise double-claim.
+        let threshold_mins =
+            (self.handler.max_duration_secs() / 60) as i64 + IDLE_CLAIM_TIMEOUT_MINS;
         match sqlx::query!(
             r#"
             UPDATE jobs SET status = 'pending', started_at = NULL, worker_id = NULL
@@ -240,7 +278,7 @@ impl QueueRunner {
               AND started_at < now() - ($2 * interval '1 minute')
             "#,
             self.queue,
-            IDLE_CLAIM_TIMEOUT_MINS as f64,
+            threshold_mins as f64,
         )
         .execute(&self.state.pool)
         .await

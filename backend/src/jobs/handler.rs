@@ -26,6 +26,7 @@ pub trait ErasedHandler: Send + Sync + 'static {
     fn queue(&self) -> &'static str;
     fn concurrency(&self) -> usize;
     fn max_attempts(&self) -> i32;
+    fn max_duration_secs(&self) -> u64;
     async fn run_erased(&self, payload: serde_json::Value, ctx: JobCtx) -> Result<(), JobError>;
 }
 
@@ -36,6 +37,12 @@ pub trait JobHandler: Send + Sync + 'static {
     /// Maximum concurrent jobs of this type across the whole worker process.
     const CONCURRENCY: usize;
     const MAX_ATTEMPTS: i32 = 5;
+    /// Hard wall-clock cap on a single run. This is a hang safeguard, not a
+    /// target duration — the runner kills and fails any execution that
+    /// exceeds it, freeing the concurrency slot it would otherwise leak
+    /// forever. Default is generous; override for handlers that legitimately
+    /// need longer (e.g. bulk imports).
+    const MAX_DURATION_SECS: u64 = 3 * 3600;
     /// The payload struct deserialized from `jobs.payload`.
     type Args: DeserializeOwned + Send + Sync + 'static;
 
@@ -53,6 +60,9 @@ impl<H: JobHandler> ErasedHandler for H {
     }
     fn max_attempts(&self) -> i32 {
         H::MAX_ATTEMPTS
+    }
+    fn max_duration_secs(&self) -> u64 {
+        H::MAX_DURATION_SECS
     }
 
     async fn run_erased(&self, payload: serde_json::Value, ctx: JobCtx) -> Result<(), JobError> {
