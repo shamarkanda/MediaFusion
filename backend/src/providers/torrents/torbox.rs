@@ -429,35 +429,31 @@ pub async fn get_video_url(
     }
 
     // Add the torrent; DIFF_ISSUE means TorBox already has it (caching race with
-    // our earlier mylist/queued check) — re-check mylist once.
-    let create_resp =
-        match submit_torrent(http, token, &magnet, torrent_file, torrent_name, forward).await {
-            Ok(r) => r,
-            Err(ProviderError::Api { ref message, .. }) if message.contains("DIFF_ISSUE") => {
-                return ready_playback_from_mylist(
-                    http, token, info_hash, forward, filename, file_index, season, episode,
-                )
-                .await;
-            }
-            Err(e) => return Err(e),
-        };
-
-    let detail = create_resp
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if detail.contains("Found Cached") {
-        return ready_playback_from_mylist(
-            http, token, info_hash, forward, filename, file_index, season, episode,
-        )
-        .await;
+    // our earlier mylist/queued check).
+    match submit_torrent(http, token, &magnet, torrent_file, torrent_name, forward).await {
+        Ok(_) => {}
+        Err(ProviderError::Api { ref message, .. }) if message.contains("DIFF_ISSUE") => {}
+        Err(e) => return Err(e),
     }
 
-    Err(ProviderError::api(
-        "Torrent added to TorBox but not yet downloaded",
-        "torrent_not_downloaded.mp4",
-    ))
+    // The createtorrent response text ("Found Cached" or not) isn't a reliable
+    // cache signal — a torrent can already be cached on the account without that
+    // exact phrase, or just need a moment to reflect in mylist. Poll mylist
+    // briefly instead of trusting the response text.
+    const POLL_ATTEMPTS: u32 = 3;
+    const POLL_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    for attempt in 0..POLL_ATTEMPTS {
+        match ready_playback_from_mylist(
+            http, token, info_hash, forward, filename, file_index, season, episode,
+        )
+        .await
+        {
+            Ok(url) => return Ok(url),
+            Err(e) if attempt + 1 == POLL_ATTEMPTS => return Err(e),
+            Err(_) => tokio::time::sleep(POLL_DELAY).await,
+        }
+    }
+    unreachable!("loop above always returns by its last iteration")
 }
 
 /// Delete the torrent matching `info_hash` from TorBox.
